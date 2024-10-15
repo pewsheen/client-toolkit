@@ -1,8 +1,11 @@
 use std::{convert::TryInto, time::Duration};
 
 use smithay_client_toolkit::activation::RequestData;
+use smithay_client_toolkit::delegate_xdg_popup;
 use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
+use smithay_client_toolkit::shell::xdg::popup::{Popup, PopupHandler};
+use smithay_client_toolkit::shell::xdg::{self, XdgPositioner, XdgSurface};
 use smithay_client_toolkit::{
     activation::{ActivationHandler, ActivationState},
     compositor::{CompositorHandler, CompositorState},
@@ -92,6 +95,7 @@ fn main() {
     // We don't know how large the window will be yet, so lets assume the minimum size we suggested for the
     // initial memory allocation.
     let pool = SlotPool::new(256 * 256 * 4, &shm).expect("Failed to create pool");
+    let popup_pool = SlotPool::new(512 * 512 * 4, &shm).expect("Failed to create pool");
 
     let mut simple_window = SimpleWindow {
         // Seats and outputs may be hotplugged at runtime, therefore we need to setup a registry state to
@@ -110,10 +114,15 @@ fn main() {
         shift: None,
         buffer: None,
         window,
+        popup_window: None,
+        popup_pool,
+        popup_buffer: None,
         keyboard: None,
         keyboard_focus: false,
         pointer: None,
         loop_handle: event_loop.handle(),
+        xdg_shell,
+        compositor,
     };
 
     // We don't draw immediately, the configure will notify us when to first draw.
@@ -124,6 +133,113 @@ fn main() {
             println!("exiting example");
             break;
         }
+    }
+}
+
+impl PopupHandler for SimpleWindow {
+    fn configure(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _popup: &xdg::popup::Popup,
+        config: xdg::popup::PopupConfigure,
+    ) {
+        println!("Popup configured to: {:?}", config);
+
+        self.draw_popup(conn, qh, config);
+    }
+    fn done(&mut self, conn: &Connection, qh: &QueueHandle<Self>, popup: &xdg::popup::Popup) {
+        println!("Popup done");
+    }
+}
+
+impl SimpleWindow {
+    pub fn create_popup(&mut self, qh: &QueueHandle<Self>, position: (f64, f64)) {
+        let positioner = XdgPositioner::new(&self.xdg_shell).unwrap();
+        positioner.set_anchor_rect(position.0 as i32, position.1 as i32, 150, 200);
+        positioner.set_size(150, 200);
+        let popup_window = xdg::popup::Popup::new(
+            &self.window.xdg_surface().clone(),
+            &positioner,
+            &qh,
+            &self.compositor,
+            &self.xdg_shell,
+        )
+        .unwrap();
+
+        self.popup_window = Some(popup_window);
+    }
+    pub fn draw_popup(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        config: xdg::popup::PopupConfigure,
+    ) {
+        if self.popup_window.is_none() {
+            return;
+        }
+
+        let popup_window = self.popup_window.as_ref().unwrap();
+
+        println!("------------ DRAW POPUP");
+        let width = config.width;
+        let height = config.height;
+        let stride = width as i32 * 4;
+
+        let buffer = self.popup_buffer.get_or_insert_with(|| {
+            self.popup_pool
+                .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
+                .expect("create buffer")
+                .0
+        });
+
+        let canvas = match self.popup_pool.canvas(buffer) {
+            Some(canvas) => canvas,
+            None => {
+                // This should be rare, but if the compositor has not released the previous
+                // buffer, we need double-buffering.
+                let (second_buffer, canvas) = self
+                    .popup_pool
+                    .create_buffer(
+                        self.width as i32,
+                        self.height as i32,
+                        stride,
+                        wl_shm::Format::Argb8888,
+                    )
+                    .expect("create buffer");
+                *buffer = second_buffer;
+                canvas
+            }
+        };
+
+        // Draw to the window:
+        {
+            canvas.chunks_exact_mut(4).enumerate().for_each(|(_index, chunk)| {
+                let a = 0xFF;
+                let r = 255;
+                let g = 255;
+                let b = 255;
+                let color: u32 = (a << 24) + (r << 16) + (g << 8) + b;
+
+                let array: &mut [u8; 4] = chunk.try_into().unwrap();
+                *array = color.to_le_bytes();
+            });
+        }
+
+        // Damage the entire window
+        popup_window.wl_surface().damage_buffer(
+            config.position.0,
+            config.position.1,
+            width as i32,
+            height as i32,
+        );
+
+        // Request our next frame
+        popup_window.wl_surface().frame(qh, popup_window.wl_surface().clone());
+
+        // Attach and commit to present.
+        buffer.attach_to(popup_window.wl_surface()).expect("buffer attach");
+        popup_window.wl_surface().commit();
     }
 }
 
@@ -142,10 +258,15 @@ struct SimpleWindow {
     shift: Option<u32>,
     buffer: Option<Buffer>,
     window: Window,
+    popup_window: Option<Popup>,
+    popup_pool: SlotPool,
+    popup_buffer: Option<Buffer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     keyboard_focus: bool,
     pointer: Option<wl_pointer::WlPointer>,
     loop_handle: LoopHandle<'static, SimpleWindow>,
+    xdg_shell: XdgShell,
+    compositor: CompositorState,
 }
 
 impl CompositorHandler for SimpleWindow {
@@ -420,6 +541,7 @@ impl PointerHandler for SimpleWindow {
                 Press { button, .. } => {
                     println!("Press {:x} @ {:?}", button, event.position);
                     self.shift = self.shift.xor(Some(0));
+                    self.create_popup(_qh, event.position);
                 }
                 Release { button, .. } => {
                     println!("Release {:x} @ {:?}", button, event.position);
@@ -517,6 +639,7 @@ delegate_xdg_window!(SimpleWindow);
 delegate_activation!(SimpleWindow);
 
 delegate_registry!(SimpleWindow);
+delegate_xdg_popup!(SimpleWindow);
 
 impl ProvidesRegistryState for SimpleWindow {
     fn registry(&mut self) -> &mut RegistryState {
